@@ -92,6 +92,7 @@ class Database:
     # -- Settings --
     async def get_setting(self, key: str) -> str | None:
         async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
             row = await cur.fetchone()
             return row["value"] if row else None
@@ -165,7 +166,7 @@ class Database:
                 bd = p["birth_date"]
                 if bd and len(bd) >= 5:
                     bd_mmdd = bd[5:]
-                    today_mmdd = today.strftime("-%m-%d")
+                    today_mmdd = today.strftime("%m-%d")
                     if bd_mmdd == today_mmdd:
                         result.append(p)
             return result

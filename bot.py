@@ -1,10 +1,9 @@
 import asyncio
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, date
+from datetime import date, datetime
 from typing import Any
 
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command
@@ -12,11 +11,11 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeDefault,
     CallbackQuery,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -29,22 +28,31 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 db = Database(DB_PATH)
 
+# Ключи для хранения настроек команды в таблице settings
 TEAM_CHAT_ID_KEY = "team_chat_id"
 TEAM_NAME_KEY = "team_name"
 
+# Состояния пользователей: {tg_id: {"mode": "...", ...}}
 user_state: dict[int, dict[str, Any]] = {}
+# Множество отправленных поздравлений с ДР: {(tg_id, дата)}
 birthday_sent: set[tuple[int, str]] = set()
 
 
-def today_ymd() -> str:
+def today_ymd():
+    """Сегодняшняя дата в ISO-формате (ГГГГ-ММ-ДД)."""
     return date.today().isoformat()
 
 
 def parse_date(text: str) -> str | None:
+    """
+    Преобразует текстовую дату в ISO-формат.
+    Поддерживает ДД.ММ, ДД/ММ, ДД.ММ.ГГГГ, ДД.ММ.ГГ (YY -> 20YY).
+    """
     t = text.strip().replace("/", ".")
     parts = t.split(".")
     try:
         if len(parts) == 2:
+            # Только день и месяц — добавляем текущий год (или следующий, если дата уже прошла)
             d, m = map(int, parts)
             y = date.today().year
             cand = date(y, m, d)
@@ -61,35 +69,37 @@ def parse_date(text: str) -> str | None:
     return None
 
 
-def parse_birth(text: str) -> str | None:
-    d = parse_date(text)
-    if not d:
-        return None
-    return d
-
+# ═══════════════════════════ КЛАВИАТУРЫ ═══════════════════════════
 
 def main_menu() -> ReplyKeyboardMarkup:
+    """
+    Стартовая reply-клавиатура с двумя кнопками.
+    Исчезает после первого нажатия (one_time_keyboard).
+    """
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="⚽ Моя статистика"), KeyboardButton(text="🛠 Администрирование")],
+            [KeyboardButton(text="⚽ Моя статистика"),
+             KeyboardButton(text="🛠 Администрирование")],
         ],
         resize_keyboard=True,
+        one_time_keyboard=True,
         input_field_placeholder="Выбери действие",
     )
 
 
 def admin_menu() -> InlineKeyboardMarkup:
+    """Меню администратора со списком доступных действий."""
     kb = InlineKeyboardBuilder()
     for text, cb in [
-        ("🏐 Тренировка", "a:training"),
-        ("⚽ Матч", "a:match"),
-        ("📊 Опрос", "a:poll"),
-        ("🏷 Название команды", "a:teamname"),
-        ("👥 Игроки", "a:players"),
-        ("📋 Состав", "a:roster"),
-        ("🏆 Рейтинг", "a:top"),
-        ("📅 История матчей", "a:matches"),
-        ("⬅️ Назад", "nav:home"),
+        ("🏐 Тренировка", "ad:training"),
+        ("⚽ Матч", "ad:match"),
+        ("📊 Опрос", "ad:poll"),
+        ("🏷 Название команды", "ad:teamname"),
+        ("👥 Игроки", "ad:players"),
+        ("📋 Состав", "ad:roster"),
+        ("🏆 Рейтинг", "ad:top"),
+        ("📅 История матчей", "ad:matches"),
+        ("⬅️ На главную", "nav:home"),
     ]:
         kb.button(text=text, callback_data=cb)
     kb.adjust(2, 2, 2, 2, 1)
@@ -97,80 +107,111 @@ def admin_menu() -> InlineKeyboardMarkup:
 
 
 def stats_menu() -> InlineKeyboardMarkup:
+    """Меню статистики игрока."""
     kb = InlineKeyboardBuilder()
-    kb.button(text="📊 /stats", callback_data="s:stats")
-    kb.button(text="✏️ Переименовать себя", callback_data="s:rename")
-    kb.button(text="🎂 Дата рождения", callback_data="s:birth")
-    kb.button(text="⬅️ Назад", callback_data="nav:home")
+    kb.button(text="📊 Статистика", callback_data="st:show")
+    kb.button(text="✏️ Сменить имя", callback_data="st:rename")
+    kb.button(text="🎂 Дата рождения", callback_data="st:birth")
+    kb.button(text="⬅️ На главную", callback_data="nav:home")
     kb.adjust(1, 1, 1, 1)
     return kb.as_markup()
 
 
-def back_only() -> InlineKeyboardMarkup:
+def training_kb(tid: int, counts: dict | None = None) -> InlineKeyboardMarkup:
+    """
+    Клавиатура для отметки на тренировку.
+    Если переданы counts — показывает текущие результаты голосования.
+    """
+    labels = {
+        "yes": "✅",
+        "no": "❌",
+        "maybe": "🤔",
+    }
     kb = InlineKeyboardBuilder()
-    kb.button(text="⬅️ Назад", callback_data="nav:home")
+    for status, emoji in labels.items():
+        txt = f"{emoji}"
+        if counts:
+            txt += f" {counts.get(status, 0)}"
+        else:
+            txt += {"yes": " Буду", "no": " Не буду", "maybe": " Под вопросом"}[status]
+        kb.button(text=txt, callback_data=f"att:{status}:{tid}")
+    kb.adjust(3)
     return kb.as_markup()
 
 
-def match_venue_menu() -> InlineKeyboardMarkup:
+def match_venue_kb() -> InlineKeyboardMarkup:
+    """Выбор места проведения матча."""
     kb = InlineKeyboardBuilder()
-    kb.button(text="🏠 Дома", callback_data="m:venue:home")
-    kb.button(text="✈️ В гостях", callback_data="m:venue:away")
+    kb.button(text="🏠 Дома", callback_data="mv:home")
+    kb.button(text="✈️ В гостях", callback_data="mv:away")
     kb.button(text="⬅️ Назад", callback_data="nav:admin")
     kb.adjust(2, 1)
     return kb.as_markup()
 
 
-def score_menu(prefix: str) -> InlineKeyboardMarkup:
+def score_kb(prefix: str) -> InlineKeyboardMarkup:
+    """Выбор счёта из готовых вариантов или свободный ввод."""
     scores = ["0:0", "1:0", "2:0", "1:1", "2:1", "3:1", "3:2", "4:2", "5:3"]
     kb = InlineKeyboardBuilder()
     for s in scores:
         kb.button(text=s, callback_data=f"{prefix}:{s}")
-    kb.button(text="✏️ Свой вариант", callback_data=f"{prefix}:custom")
+    kb.button(text="✏️ Свой", callback_data=f"{prefix}:custom")
     kb.button(text="⬅️ Назад", callback_data="nav:admin")
     kb.adjust(3, 3, 3, 1, 1)
     return kb.as_markup()
 
 
-def player_action_menu(pid: int) -> InlineKeyboardMarkup:
+def player_menu(pid: int) -> InlineKeyboardMarkup:
+    """Меню управления конкретным игроком (для админа)."""
     kb = InlineKeyboardBuilder()
-    kb.button(text="🔢 Номер", callback_data=f"p:{pid}:number")
-    kb.button(text="🎂 Дата рождения", callback_data=f"p:{pid}:birth")
-    kb.button(text="✏️ Переименовать", callback_data=f"p:{pid}:rename")
-    kb.button(text="🗑 Удалить", callback_data=f"p:{pid}:delete")
-    kb.button(text="⬅️ Назад", callback_data="a:players")
+    kb.button(text="🔢 Номер", callback_data=f"pl:{pid}:num")
+    kb.button(text="🎂 ДР", callback_data=f"pl:{pid}:birth")
+    kb.button(text="✏️ Переименовать", callback_data=f"pl:{pid}:rename")
+    kb.button(text="🗑 Удалить", callback_data=f"pl:{pid}:delete")
+    kb.button(text="⬅️ Назад к списку", callback_data="ad:players")
     kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
+# ═══════════════════════════ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ═══════════════════════════
+
 async def is_admin(chat_id: int, user_id: int) -> bool:
-    admins = await bot.get_chat_administrators(chat_id)
-    return any(a.user.id == user_id for a in admins)
+    """Проверка, является ли пользователь администратором чата."""
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        return any(a.user.id == user_id for a in admins)
+    except Exception:
+        return False
 
 
 async def ensure_player(tg_id: int, name: str):
+    """Регистрирует игрока, если его ещё нет в БД."""
     p = await db.get_player(tg_id)
     if not p:
         await db.register_player(tg_id, name)
-        return True
-    return False
 
 
-async def delete_later(message: Message, seconds: int = 15):
-    await asyncio.sleep(seconds)
+async def del_later(msg: Message, sec: int = 15):
+    """Удаляет сообщение через указанное количество секунд."""
+    await asyncio.sleep(sec)
     try:
-        await message.delete()
+        await msg.delete()
     except Exception:
         pass
 
 
-async def answer_ephemeral(message: Message, text: str, markup=None, seconds: int = 15):
-    msg = await message.answer(text, reply_markup=markup)
-    asyncio.create_task(delete_later(msg, seconds))
-    return msg
+async def ephemeral(msg: Message, text: str, sec: int = 15):
+    """
+    Отправляет временное сообщение, которое удалится через sec секунд.
+    Используется только для подсказок и статусных сообщений.
+    """
+    m = await msg.answer(text)
+    asyncio.create_task(del_later(m, sec))
+    return m
 
 
 async def set_commands():
+    """Устанавливает список команд для автодополнения в Telegram."""
     await bot.set_my_commands([
         BotCommand(command="start", description="Запуск"),
         BotCommand(command="stats", description="Моя статистика"),
@@ -185,562 +226,637 @@ async def set_commands():
 
 
 async def team_name() -> str:
+    """Возвращает название команды из настроек."""
     return await db.get_setting(TEAM_NAME_KEY) or "Футзальная команда"
 
 
 async def team_chat_id() -> int | None:
+    """Возвращает ID чата команды из настроек."""
     v = await db.get_setting(TEAM_CHAT_ID_KEY)
     return int(v) if v else None
 
 
 async def ensure_team_chat(chat_id: int):
+    """Сохраняет ID чата как командный, если ещё не сохранён."""
     if await db.get_setting(TEAM_CHAT_ID_KEY) != str(chat_id):
         await db.set_setting(TEAM_CHAT_ID_KEY, str(chat_id))
 
 
+async def show_stats(msg: Message, user_id: int):
+    """Показывает статистику игрока в persistent-сообщении с инлайн-меню."""
+    p = await db.get_player(user_id)
+    name = p["name"] if p else "Игрок"
+    stats = await db.get_player_stats(user_id)
+    if not stats or not stats["total"]:
+        txt = f"📊 <b>{name}</b>\nПока нет статистики."
+    else:
+        pct = round(stats["yes"] / stats["total"] * 100)
+        txt = (
+            f"📊 <b>{name}</b>\n"
+            f"✅ Был: {stats['yes']} ({pct}%)\n"
+            f"❌ Не был: {stats['no']}\n"
+            f"🤔 Под вопросом: {stats['maybe']}"
+        )
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await msg.answer(txt, reply_markup=stats_menu())
+
+
+async def show_admin_menu(msg: Message):
+    """Показывает меню администратора (persistent-сообщение)."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await msg.answer("🛠 <b>Администрирование</b>", reply_markup=admin_menu())
+
+
+# ═══════════════════════════ ДНИ РОЖДЕНИЯ ═══════════════════════════
+
 async def birthday_watcher():
+    """Фоновая задача: проверяет дни рождения каждые 30 минут."""
     while True:
         try:
             chat_id = await team_chat_id()
             if chat_id:
-                players = await db.get_players_with_birthdays_today()
-                for p in players:
+                for p in await db.get_players_with_birthdays_today():
                     key = (p["tg_id"], today_ymd())
                     if key in birthday_sent:
                         continue
-                    bd = p["birth_date"]
-                    age = date.today().year - int(bd[:4])
+                    age = date.today().year - int(p["birth_date"][:4])
                     await bot.send_message(
                         chat_id,
                         f"🎉 <b>Сегодня день рождения у {p['name']}!</b>\nЕму исполнилось {age} лет.",
                     )
                     birthday_sent.add(key)
         except Exception as e:
-            logging.warning("birthday watcher: %s", e)
+            logging.warning("birthday: %s", e)
         await asyncio.sleep(1800)
 
 
+# ═══════════════════════════ ОБРАБОТЧИКИ КОМАНД ═══════════════════════════
+
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
-    if message.chat.type != ChatType.PRIVATE and await ensure_player(message.from_user.id, message.from_user.full_name or "Игрок"):
+async def cmd_start(msg: Message):
+    """Команда /start — показывает reply-клавиатуру с главным меню."""
+    if msg.chat.type != ChatType.PRIVATE:
+        await ensure_team_chat(msg.chat.id)
+    await ensure_player(msg.from_user.id, msg.from_user.full_name or "Игрок")
+    try:
+        await msg.delete()
+    except Exception:
         pass
-    await message.delete()
-    await answer_ephemeral(
-        message,
-        "👋 <b>Футзал</b>\nВыбери действие.",
-        main_menu(),
-    )
+    await ephemeral(msg, "👋 <b>Футзальная команда</b> — используй кнопки меню ниже", sec=8)
+    await msg.answer(".", reply_markup=main_menu())
 
 
 @dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.delete()
-    await answer_ephemeral(
-        message,
-        "📋 /stats /training /roster /top /match /matches /poll",
-        main_menu(),
-    )
+async def cmd_help(msg: Message):
+    """Команда /help — список доступных команд."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await ephemeral(msg, "Команды: /stats /training /roster /top /match /matches /poll")
 
 
 @dp.message(F.text == "⚽ Моя статистика")
-async def stats_entry(message: Message):
-    await message.delete()
-    await ensure_player(message.from_user.id, message.from_user.full_name or "Игрок")
-    p = await db.get_player(message.from_user.id)
+async def stats_btn(msg: Message):
+    """Обработчик нажатия reply-кнопки «Моя статистика»."""
+    await ensure_player(msg.from_user.id, msg.from_user.full_name or "Игрок")
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    p = await db.get_player(msg.from_user.id)
     if not p or not p["birth_date"]:
-        await db.update_player_name(message.from_user.id, message.from_user.full_name or "Игрок")
-        user_state[message.from_user.id] = {"mode": "first_reg_birth"}
-        await answer_ephemeral(message, "Введи дату рождения в формате ДД.ММ.ГГГГ", back_only())
+        # Первый вход — запрашиваем дату рождения
+        await db.update_player_name(msg.from_user.id, msg.from_user.full_name or "Игрок")
+        user_state[msg.from_user.id] = {"mode": "birth_reg"}
+        await ephemeral(msg, "Введи дату рождения в формате ДД.ММ.ГГГГ", sec=30)
         return
-    await stats_show(message)
+    await show_stats(msg, msg.from_user.id)
 
 
 @dp.message(F.text == "🛠 Администрирование")
-async def admin_entry(message: Message):
-    await message.delete()
-    if message.chat.type == ChatType.PRIVATE or await is_admin(message.chat.id, message.from_user.id):
-        await answer_ephemeral(message, "🛠 <b>Администрирование</b>", admin_menu())
+async def admin_btn(msg: Message):
+    """Обработчик нажатия reply-кнопки «Администрирование»."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    if msg.chat.type == ChatType.PRIVATE or await is_admin(msg.chat.id, msg.from_user.id):
+        await show_admin_menu(msg)
     else:
-        await answer_ephemeral(message, "Нет доступа.", main_menu(), 8)
-
-
-async def stats_show(message: Message):
-    p = await db.get_player(message.from_user.id)
-    name = p["name"] if p else message.from_user.full_name
-    stats = await db.get_player_stats(message.from_user.id)
-    if not stats or stats["total"] == 0:
-        txt = f"📊 <b>{name}</b>\nПока нет статистики."
-    else:
-        pct = round((stats["yes"] or 0) / stats["total"] * 100) if stats["total"] else 0
-        txt = (
-            f"📊 <b>{name}</b>\n"
-            f"✅ Был: {stats['yes'] or 0} ({pct}%)\n"
-            f"❌ Не был: {stats['no'] or 0}\n"
-            f"🤔 Под вопросом: {stats['maybe'] or 0}"
-        )
-    await answer_ephemeral(message, txt, stats_menu())
+        await ephemeral(msg, "❌ Нет доступа. Эта кнопка только для администраторов чата.", sec=8)
 
 
 @dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    await message.delete()
-    await ensure_player(message.from_user.id, message.from_user.full_name or "Игрок")
-    await stats_show(message)
+async def cmd_stats(msg: Message):
+    """Команда /stats — показывает статистику игрока."""
+    await ensure_player(msg.from_user.id, msg.from_user.full_name or "Игрок")
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await show_stats(msg, msg.from_user.id)
 
 
 @dp.message(Command("training"))
-async def cmd_training(message: Message):
-    await message.delete()
-    if message.chat.type != ChatType.PRIVATE:
-        await ensure_team_chat(message.chat.id)
-    args = message.text.split(maxsplit=2)
+async def cmd_training(msg: Message):
+    """
+    Команда /training — создаёт тренировку.
+    Формат: /training ДД.ММ [ЧЧ:ММ] [место]
+    """
+    if msg.chat.type != ChatType.PRIVATE:
+        await ensure_team_chat(msg.chat.id)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    args = msg.text.split(maxsplit=2)
     if len(args) < 2:
-        await answer_ephemeral(message, "Используй: /training ДД.ММ [ЧЧ:ММ] [место]", admin_menu())
+        await ephemeral(msg, "Формат: /training ДД.ММ [ЧЧ:ММ] [место]")
         return
     d = parse_date(args[1])
     if not d:
-        await answer_ephemeral(message, "Неверная дата.", admin_menu())
+        await ephemeral(msg, "Неверная дата.")
         return
-    time_ = args[2] if len(args) > 2 else "20:00"
-    training_id = await db.create_training(d, time_, "Обычное место")
-    t = await db.get_training(training_id)
-    await message.answer(f"🏐 <b>Тренировка</b>\n{datetime.fromisoformat(t['date']).strftime('%d.%m')} {t['time']}", reply_markup=training_keyboard(training_id))
-
-
-def training_keyboard(training_id: int):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Буду", callback_data=f"att:yes:{training_id}")
-    kb.button(text="❌ Не буду", callback_data=f"att:no:{training_id}")
-    kb.button(text="🤔 Под вопросом", callback_data=f"att:maybe:{training_id}")
-    kb.adjust(3)
-    return kb.as_markup()
+    t = args[2] if len(args) > 2 else "20:00"
+    tid = await db.create_training(d, t)
+    tr = await db.get_training(tid)
+    dt = date.fromisoformat(tr["date"]).strftime("%d.%m")
+    await msg.answer(
+        f"🏐 <b>Тренировка</b>\n📅 {dt} | {tr['time']}\n👇 Отметься:",
+        reply_markup=training_kb(tid),
+    )
 
 
 @dp.message(Command("roster"))
-async def cmd_roster(message: Message):
-    await message.delete()
+async def cmd_roster(msg: Message):
+    """Команда /roster — показывает состав команды."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
     players = await db.get_all_players()
-    text = "👥 <b>Состав</b>\n" + ("\n".join([f"• {p['name']}" + (f" №{p['player_number']}" if p['player_number'] else "") for p in players]) or "Пусто")
-    await answer_ephemeral(message, text, admin_menu() if (message.chat.type == ChatType.PRIVATE or await is_admin(message.chat.id, message.from_user.id)) else main_menu())
+    lines = [f"👥 <b>{await team_name()}</b>"]
+    for p in players:
+        n = p["name"] + (f" №{p['player_number']}" if p["player_number"] else "")
+        lines.append(f"· {n}")
+    await ephemeral(msg, "\n".join(lines) or "Пока пусто.", sec=30)
 
 
 @dp.message(Command("top"))
-async def cmd_top(message: Message):
-    await message.delete()
+async def cmd_top(msg: Message):
+    """Команда /top — рейтинг посещаемости."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
     top = await db.get_top_attendance(10)
-    text = "🏆 <b>Рейтинг</b>\n" + "\n".join([f"{i+1}. {p['name']} — {p['yes'] or 0}" for i, p in enumerate(top)])
-    await answer_ephemeral(message, text, admin_menu() if message.chat.type == ChatType.PRIVATE or await is_admin(message.chat.id, message.from_user.id) else main_menu())
+    lines = ["🏆 <b>Рейтинг посещаемости</b>"]
+    for i, p in enumerate(top, 1):
+        lines.append(f"{i}. {p['name']} — {p['yes'] or 0}")
+    await ephemeral(msg, "\n".join(lines) or "Пока пусто.", sec=30)
 
 
 @dp.message(Command("matches"))
-async def cmd_matches(message: Message):
-    await message.delete()
+async def cmd_matches(msg: Message):
+    """Команда /matches — история матчей."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
     rows = await db.get_matches(10)
-    text = "📋 <b>Матчи</b>\n" + "\n".join([f"• {r['date']} vs {r['opponent']} — {r['our_score'] if r['our_score'] is not None else '—'}:{r['their_score'] if r['their_score'] is not None else '—'}" for r in rows])
-    await answer_ephemeral(message, text, admin_menu())
+    lines = ["📋 <b>История матчей</b>"]
+    for r in rows:
+        s = f"{r['our_score'] or '—'}:{r['their_score'] or '—'}"
+        lines.append(f"· {r['date'][:10]} vs {r['opponent']} — {s}")
+    await ephemeral(msg, "\n".join(lines) or "Пока пусто.", sec=30)
 
 
 @dp.message(Command("match"))
-async def cmd_match(message: Message):
-    await message.delete()
-    if message.chat.type != ChatType.PRIVATE and not await is_admin(message.chat.id, message.from_user.id):
+async def cmd_match(msg: Message):
+    """Команда /match — создание матча (пошаговый мастер)."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    if msg.chat.type != ChatType.PRIVATE and not await is_admin(msg.chat.id, msg.from_user.id):
         return
-    user_state[message.from_user.id] = {"mode": "match", "data": {}}
-    await message.answer("⚽ <b>Добавление матча</b>", reply_markup=match_venue_menu())
+    user_state[msg.from_user.id] = {"mode": "match", "data": {}}
+    await msg.answer("⚽ Где играем?", reply_markup=match_venue_kb())
 
 
 @dp.message(Command("poll"))
-async def cmd_poll(message: Message):
-    await message.delete()
-    if message.chat.type != ChatType.PRIVATE and not await is_admin(message.chat.id, message.from_user.id):
+async def cmd_poll(msg: Message):
+    """Команда /poll — создание опроса. Формат: /poll Вопрос | Вариант1 | Вариант2"""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    if msg.chat.type != ChatType.PRIVATE and not await is_admin(msg.chat.id, msg.from_user.id):
         return
-    await answer_ephemeral(message, "Формат: /poll Вопрос | Вариант1 | Вариант2", admin_menu())
-
-
-@dp.message(F.text)
-async def free_text(message: Message):
-    st = user_state.get(message.from_user.id)
-    if not st:
+    text = msg.text.replace("/poll", "").strip()
+    if "|" not in text:
+        await ephemeral(msg, "Формат: /poll Вопрос | Вариант1 | Вариант2")
         return
-    if st.get("mode") == "first_reg_birth":
-        bd = parse_birth(message.text)
-        if not bd:
-            await message.delete()
-            await answer_ephemeral(message, "Неверная дата. Формат ДД.ММ.ГГГГ", stats_menu())
-            return
-        await db.update_player_birth(message.from_user.id, bd)
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Сохранено.", main_menu(), 8)
-    elif st.get("mode") == "rename_self":
-        await db.update_player_name(message.from_user.id, message.text.strip())
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Имя обновлено.", stats_menu(), 8)
-    elif st.get("mode") == "match":
-        data = st.setdefault("data", {})
-        step = st.get("step")
-        txt = message.text.strip()
-        if step == "score_custom":
-            data["score"] = txt
-            st["step"] = "ht_custom"
-            await message.delete()
-            await answer_ephemeral(message, "Счёт 1-го тайма: отправь как 1:0", back_only())
-        elif step == "ht_custom":
-            data["ht_score"] = txt
-            st["step"] = "date"
-            await message.delete()
-            await answer_ephemeral(message, "Дата матча: ДД.ММ", back_only())
-        elif step == "opponent":
-            data["opponent"] = txt
-            d = parse_date(data.get("date", ""))
-            if not d:
-                await message.delete()
-                await answer_ephemeral(message, "Неверная дата.", back_only())
-                return
-            our, their = map(int, data["score"].split(":"))
-            hot, htheir = map(int, data["ht_score"].split(":"))
-            mid = await db.create_match(d, data["opponent"], data.get("venue", "home"))
-            await db.update_match_score(mid, our, their, hot, htheir)
-            user_state.pop(message.from_user.id, None)
-            await message.delete()
-            await answer_ephemeral(message, f"Матч сохранён: {data['opponent']} {data['score']}", admin_menu(), 10)
-        elif step == "date":
-            data["date"] = txt
-            st["step"] = "opponent"
-            await message.delete()
-            await answer_ephemeral(message, "Соперник?", back_only())
-    elif st.get("mode") == "admin_rename_player":
-        pid = st["pid"]
-        await db.update_player_name(pid, message.text.strip())
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Игрок переименован.", admin_menu(), 10)
-    elif st.get("mode") == "admin_birth_player":
-        pid = st["pid"]
-        bd = parse_birth(message.text)
-        if not bd:
-            await message.delete()
-            await answer_ephemeral(message, "Неверная дата.", admin_menu(), 8)
-            return
-        await db.update_player_birth(pid, bd)
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Дата рождения сохранена.", admin_menu(), 10)
-    elif st.get("mode") == "admin_number_player":
-        pid = st["pid"]
-        try:
-            n = int(message.text.strip())
-        except ValueError:
-            await message.delete()
-            await answer_ephemeral(message, "Нужен номер числом.", admin_menu(), 8)
-            return
-        await db.update_player_number(pid, n)
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Номер сохранён.", admin_menu(), 10)
-    elif st.get("mode") == "admin_teamname":
-        await db.set_setting(TEAM_NAME_KEY, message.text.strip())
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Название команды сохранено.", admin_menu(), 10)
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) < 3:
+        await ephemeral(msg, "Нужен вопрос и минимум 2 варианта.")
+        return
+    question = parts[0]
+    options = parts[1:]
+    pid = await db.create_poll(question, options, msg.chat.id)
+    kb = InlineKeyboardBuilder()
+    for i, opt in enumerate(options):
+        kb.button(text=opt, callback_data=f"pv:{pid}:{i}")
+    kb.adjust(1 if len(options) <= 3 else 2)
+    m = await msg.answer(f"📊 <b>Опрос</b>\n{question}", reply_markup=kb.as_markup())
+    await db.set_poll_msg_id(pid, m.message_id)
 
+
+# ═══════════════════════════ ОБРАБОТЧИКИ CALLBACK-ЗАПРОСОВ ═══════════════════════════
 
 @dp.callback_query(F.data == "nav:home")
 async def nav_home(cb: CallbackQuery):
+    """Возвращает пользователя к reply-клавиатуре главного меню."""
     await cb.answer()
-    await cb.message.edit_text("Выбери действие", reply_markup=None)
-    await cb.message.answer("Главное меню", reply_markup=main_menu())
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await ephemeral(cb.message, "Главное меню", sec=4)
+    await cb.message.answer(".", reply_markup=main_menu())
 
 
 @dp.callback_query(F.data == "nav:admin")
 async def nav_admin(cb: CallbackQuery):
+    """Возвращает в меню администратора."""
     if cb.message.chat.type != ChatType.PRIVATE and not await is_admin(cb.message.chat.id, cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
+        await cb.answer("❌ Нет доступа", show_alert=True)
         return
     await cb.answer()
-    await cb.message.edit_text("🛠 Администрирование", reply_markup=admin_menu())
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.message.answer("🛠 <b>Администрирование</b>", reply_markup=admin_menu())
 
 
-@dp.callback_query(F.data == "s:stats")
-async def stats_cb(cb: CallbackQuery):
+@dp.callback_query(F.data.startswith("att:"))
+async def att_cb(cb: CallbackQuery):
+    """Обрабатывает нажатие кнопки отметки на тренировку, обновляет клавиатуру."""
+    _, status, tid = cb.data.split(":")
+    tid = int(tid)
+    uid = cb.from_user.id
+    name = cb.from_user.full_name or "Игрок"
+    await ensure_player(uid, name)
+    await db.set_attendance(tid, uid, status)
+
+    # Получаем актуальные результаты и обновляем клавиатуру
+    attending = await db.get_training_attendance(tid)
+    counts = {"yes": 0, "no": 0, "maybe": 0}
+    for a in attending:
+        s = a["status"]
+        if s in counts:
+            counts[s] += 1
+    labels = {"yes": "✅ Буду", "no": "❌ Не буду", "maybe": "🤔 Под вопросом"}
+    await cb.answer(f"{labels[status]}", show_alert=False)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=training_kb(tid, counts))
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "st:show")
+async def st_show(cb: CallbackQuery):
+    """Показывает статистику игрока (из инлайн-меню статистики)."""
     await cb.answer()
-    await cb.message.delete()
-    await stats_show(cb.message)
+    await ensure_player(cb.from_user.id, cb.from_user.full_name or "Игрок")
+    await show_stats(cb.message, cb.from_user.id)
 
 
-@dp.callback_query(F.data == "s:rename")
-async def rename_self(cb: CallbackQuery):
+@dp.callback_query(F.data == "st:rename")
+async def st_rename(cb: CallbackQuery):
+    """Запрашивает новое имя для смены (из инлайн-меню статистики)."""
     await cb.answer()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
     user_state[cb.from_user.id] = {"mode": "rename_self"}
-    await cb.message.answer("Введите новое имя.", reply_markup=stats_menu())
+    await cb.message.answer("✏️ Введи новое имя:", reply_markup=stats_menu())
 
 
-@dp.callback_query(F.data == "s:birth")
-async def birth_self(cb: CallbackQuery):
+@dp.callback_query(F.data == "st:birth")
+async def st_birth(cb: CallbackQuery):
+    """Запрашивает дату рождения (из инлайн-меню статистики)."""
     await cb.answer()
-    user_state[cb.from_user.id] = {"mode": "first_reg_birth"}
-    await cb.message.answer("Введите дату рождения: ДД.ММ.ГГГГ", reply_markup=stats_menu())
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    user_state[cb.from_user.id] = {"mode": "birth_reg"}
+    await cb.message.answer("🎂 Введи дату рождения в формате ДД.ММ.ГГГГ:", reply_markup=stats_menu())
 
 
-@dp.callback_query(F.data == "a:teamname")
-async def admin_teamname(cb: CallbackQuery):
+@dp.callback_query(F.data.startswith("ad:"))
+async def admin_cb(cb: CallbackQuery):
+    """Обрабатывает нажатия кнопок в меню администратора."""
+    action = cb.data.split(":")[1]
     if cb.message.chat.type != ChatType.PRIVATE and not await is_admin(cb.message.chat.id, cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
+        await cb.answer("❌ Нет доступа", show_alert=True)
         return
     await cb.answer()
-    user_state[cb.from_user.id] = {"mode": "admin_teamname"}
-    await cb.message.answer("Введите название команды.", reply_markup=admin_menu())
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
+    if action == "training":
+        await ephemeral(cb.message, "Формат: /training ДД.ММ [ЧЧ:ММ]")
+    elif action == "poll":
+        await ephemeral(cb.message, "Формат: /poll Вопрос | Вариант1 | Вариант2")
+    elif action == "teamname":
+        user_state[cb.from_user.id] = {"mode": "set_teamname"}
+        await cb.message.answer("🏷 Введи название команды:")
+    elif action == "players":
+        players = await db.get_all_players()
+        if not players:
+            await cb.message.answer("👥 Игроков пока нет.")
+            return
+        kb = InlineKeyboardBuilder()
+        for p in players:
+            kb.button(text=p["name"], callback_data=f"pl:{p['tg_id']}:menu")
+        kb.button(text="⬅️ Назад", callback_data="nav:admin")
+        kb.adjust(2)
+        await cb.message.answer("👥 Игроки:", reply_markup=kb.as_markup())
+    elif action == "roster":
+        players = await db.get_all_players()
+        lines = [f"👥 <b>{await team_name()}</b>"]
+        for p in players:
+            n = p["name"] + (f" №{p['player_number']}" if p["player_number"] else "")
+            lines.append(f"· {n}")
+        await cb.message.answer("\n".join(lines), reply_markup=admin_menu())
+    elif action == "top":
+        top = await db.get_top_attendance(10)
+        lines = ["🏆 <b>Рейтинг посещаемости</b>"]
+        for i, p in enumerate(top, 1):
+            lines.append(f"{i}. {p['name']} — {p['yes'] or 0}")
+        await cb.message.answer("\n".join(lines), reply_markup=admin_menu())
+    elif action == "matches":
+        rows = await db.get_matches(10)
+        lines = ["📅 <b>История матчей</b>"]
+        for r in rows:
+            s = f"{r['our_score'] or '—'}:{r['their_score'] or '—'}"
+            lines.append(f"· {r['date'][:10]} vs {r['opponent']} — {s}")
+        await cb.message.answer("\n".join(lines), reply_markup=admin_menu())
+    elif action == "match":
+        user_state[cb.from_user.id] = {"mode": "match", "data": {}}
+        await cb.message.answer("⚽ Где играем?", reply_markup=match_venue_kb())
 
 
-@dp.callback_query(F.data == "a:players")
-async def admin_players(cb: CallbackQuery):
+@dp.callback_query(F.data.startswith("pl:"))
+async def player_callbacks(cb: CallbackQuery):
+    """Обрабатывает нажатия кнопок в меню управления игроком."""
     if cb.message.chat.type != ChatType.PRIVATE and not await is_admin(cb.message.chat.id, cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
-    await cb.answer()
-    players = await db.get_all_players()
-    kb = InlineKeyboardBuilder()
-    for p in players:
-        kb.button(text=p["name"], callback_data=f"p:{p['tg_id']}:menu")
-    kb.button(text="⬅️ Назад", callback_data="nav:admin")
-    kb.adjust(2)
-    await cb.message.edit_text("👥 Игроки", reply_markup=kb.as_markup())
-
-
-@dp.callback_query(F.data.startswith("p:"))
-async def player_actions(cb: CallbackQuery):
-    if cb.message.chat.type != ChatType.PRIVATE and not await is_admin(cb.message.chat.id, cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
+        await cb.answer("❌ Нет доступа", show_alert=True)
         return
     _, pid, action = cb.data.split(":")
     pid = int(pid)
+    await cb.answer()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
     if action == "menu":
         p = await db.get_player(pid)
-        text = f"<b>{p['name']}</b>"
+        t = f"<b>{p['name']}</b>"
         if p["player_number"]:
-            text += f"\n№ {p['player_number']}"
+            t += f"\n🔢 № {p['player_number']}"
         if p["birth_date"]:
-            text += f"\n🎂 {p['birth_date']}"
-        await cb.answer()
-        await cb.message.edit_text(text, reply_markup=player_action_menu(pid))
-        return
-    if action == "rename":
-        user_state[cb.from_user.id] = {"mode": "admin_rename_player", "pid": pid}
-        await cb.answer()
-        await cb.message.answer("Новое имя игрока?")
+            t += f"\n🎂 {p['birth_date'][:10]}"
+        await cb.message.answer(t, reply_markup=player_menu(pid))
+    elif action == "rename":
+        user_state[cb.from_user.id] = {"mode": "rename_player", "pid": pid}
+        await cb.message.answer("✏️ Новое имя игрока?")
     elif action == "birth":
-        user_state[cb.from_user.id] = {"mode": "admin_birth_player", "pid": pid}
-        await cb.answer()
-        await cb.message.answer("Дата рождения: ДД.ММ.ГГГГ")
-    elif action == "number":
-        user_state[cb.from_user.id] = {"mode": "admin_number_player", "pid": pid}
-        await cb.answer()
-        await cb.message.answer("Номер игрока?")
+        user_state[cb.from_user.id] = {"mode": "player_birth", "pid": pid}
+        await cb.message.answer("🎂 Дата рождения игрока: ДД.ММ.ГГГГ")
+    elif action == "num":
+        user_state[cb.from_user.id] = {"mode": "player_num", "pid": pid}
+        await cb.message.answer("🔢 Номер игрока?")
     elif action == "delete":
         await db.deactivate_player(pid)
-        await cb.answer("Удалено", show_alert=False)
-        await admin_players(cb)
+        await cb.message.answer("🗑 Игрок удалён.", reply_markup=admin_menu())
 
 
-@dp.callback_query(F.data == "a:roster")
-async def admin_roster(cb: CallbackQuery):
-    await cb.answer()
-    players = await db.get_all_players()
-    lines = [f"👥 <b>{await team_name()}</b>"]
-    for p in players:
-        line = p["name"]
-        if p["player_number"]:
-            line += f" №{p['player_number']}"
-        lines.append(f"• {line}")
-    await cb.message.edit_text("\n".join(lines), reply_markup=admin_menu())
-
-
-@dp.callback_query(F.data == "a:top")
-async def admin_top(cb: CallbackQuery):
-    await cb.answer()
-    rows = await db.get_top_attendance(10)
-    txt = "🏆 Рейтинг\n" + "\n".join([f"{i+1}. {r['name']} — {r['yes'] or 0}" for i, r in enumerate(rows)])
-    await cb.message.edit_text(txt or "Пусто", reply_markup=admin_menu())
-
-
-@dp.callback_query(F.data == "a:matches")
-async def admin_matches(cb: CallbackQuery):
-    await cb.answer()
-    rows = await db.get_matches(10)
-    txt = "📅 Матчи\n" + "\n".join([f"• {r['date']} vs {r['opponent']}" for r in rows])
-    await cb.message.edit_text(txt or "Пусто", reply_markup=admin_menu())
-
-
-@dp.callback_query(F.data == "a:training")
-async def admin_training(cb: CallbackQuery):
-    if cb.message.chat.type != ChatType.PRIVATE and not await is_admin(cb.message.chat.id, cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
-    await cb.answer()
-    user_state[cb.from_user.id] = {"mode": "admin_training"}
-    await cb.message.answer("Напиши: /training ДД.ММ ЧЧ:ММ", reply_markup=admin_menu())
-
-
-@dp.callback_query(F.data == "a:match")
-async def admin_match(cb: CallbackQuery):
-    if cb.message.chat.type != ChatType.PRIVATE and not await is_admin(cb.message.chat.id, cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
-    await cb.answer()
-    user_state[cb.from_user.id] = {"mode": "match", "step": "venue", "data": {}}
-    await cb.message.answer("Где играем?", reply_markup=match_venue_menu())
-
-
-@dp.callback_query(F.data.startswith("m:venue:"))
-async def match_venue(cb: CallbackQuery):
-    _, _, venue = cb.data.split(":")
+@dp.callback_query(F.data.startswith("mv:"))
+async def match_venue_cb(cb: CallbackQuery):
+    """Шаг 1 мастера матча: выбор места проведения."""
+    venue = cb.data.split(":")[1]
     st = user_state.setdefault(cb.from_user.id, {"mode": "match", "data": {}})
     st["data"]["venue"] = venue
     st["step"] = "score"
     await cb.answer()
-    await cb.message.answer("Выбери счёт", reply_markup=score_menu("m:score"))
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.message.answer("⚽ Счёт матча:", reply_markup=score_kb("ms"))
 
 
-@dp.callback_query(F.data.startswith("m:score:"))
-async def match_score(cb: CallbackQuery):
-    score = cb.data.split(":", 2)[2]
+@dp.callback_query(F.data.startswith("ms:"))
+async def match_score_cb(cb: CallbackQuery):
+    """Шаг 2 мастера матча: выбор счёта."""
+    score = cb.data.split(":", 1)[1]
     st = user_state.setdefault(cb.from_user.id, {"mode": "match", "data": {}})
     if score == "custom":
         st["step"] = "score_custom"
         await cb.answer()
-        await cb.message.answer("Свой счёт? Формат 3:2")
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
+        await cb.message.answer("✏️ Введи счёт (например 3:2):")
         return
     st["data"]["score"] = score
     st["step"] = "ht"
     await cb.answer()
-    await cb.message.answer("Счёт после 1 тайма", reply_markup=score_menu("m:ht"))
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.message.answer("⚽ Счёт первого тайма:", reply_markup=score_kb("mh"))
 
 
-@dp.callback_query(F.data.startswith("m:ht:"))
-async def match_ht(cb: CallbackQuery):
-    score = cb.data.split(":", 2)[2]
+@dp.callback_query(F.data.startswith("mh:"))
+async def match_ht_cb(cb: CallbackQuery):
+    """Шаг 3 мастера матча: выбор счёта первого тайма."""
+    score = cb.data.split(":", 1)[1]
     st = user_state.setdefault(cb.from_user.id, {"mode": "match", "data": {}})
     if score == "custom":
         st["step"] = "ht_custom"
         await cb.answer()
-        await cb.message.answer("Свой счёт 1 тайма? Формат 1:0")
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
+        await cb.message.answer("✏️ Введи счёт первого тайма (например 1:0):")
         return
     st["data"]["ht_score"] = score
     st["step"] = "date"
     await cb.answer()
-    await cb.message.answer("Дата матча: ДД.ММ")
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.message.answer("📅 Дата матча (ДД.ММ):")
 
 
-@dp.message(Command("matchconfirm"))
-async def match_confirm(message: Message):
-    pass
+@dp.callback_query(F.data.startswith("pv:"))
+async def poll_vote_cb(cb: CallbackQuery):
+    """Обрабатывает голосование в опросе, обновляет отображение."""
+    _, pid, opt = cb.data.split(":")
+    pid = int(pid)
+    opt = int(opt)
+    uid = cb.from_user.id
+    await ensure_player(uid, cb.from_user.full_name or "Игрок")
+    await db.vote_poll(pid, uid, opt)
+    poll = await db.get_poll(pid)
+    options = poll["options"].split("|||")
+    results = await db.get_poll_results(pid)
+    lines = [f"📊 <b>{poll['question']}</b>"]
+    for i, o in enumerate(options):
+        cnt = results.get(i, 0)
+        lines.append(f"  {o} — {cnt}")
+    lines.append(f"\n✅ Твой выбор: {options[opt]}")
+    await cb.answer()
+    try:
+        await cb.message.edit_text("\n".join(lines))
+    except Exception:
+        pass
 
+
+# ═══════════════════════════ ОБРАБОТЧИК ТЕКСТОВОГО ВВОДА ═══════════════════════════
 
 @dp.message(F.text)
-async def router_text(message: Message):
-    st = user_state.get(message.from_user.id)
+async def text_input(msg: Message):
+    """
+    Принимает текстовый ввод, когда пользователь находится в одном из режимов:
+    birth_reg, rename_self, set_teamname, rename_player, player_birth,
+    player_num, match (score_custom, ht_custom, date, opponent).
+    """
+    st = user_state.get(msg.from_user.id)
     if not st:
         return
+
     mode = st.get("mode")
-    text = message.text.strip()
-    if mode == "first_reg_birth":
-        bd = parse_birth(text)
+    text = msg.text.strip()
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    # Регистрация даты рождения (для текущего игрока)
+    if mode == "birth_reg":
+        bd = parse_date(text)
         if not bd:
-            await message.delete()
-            await answer_ephemeral(message, "Дата должна быть ДД.ММ.ГГГГ", main_menu())
+            await ephemeral(msg, "❌ Неверный формат. Используй ДД.ММ.ГГГГ", sec=8)
             return
-        await db.update_player_birth(message.from_user.id, bd)
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Сохранено.", main_menu(), 8)
+        await db.update_player_birth(msg.from_user.id, bd)
+        user_state.pop(msg.from_user.id, None)
+        await ephemeral(msg, "✅ Дата рождения сохранена!", sec=8)
+        await show_stats(msg, msg.from_user.id)
+
+    # Смена имени (текущий игрок)
     elif mode == "rename_self":
-        await db.update_player_name(message.from_user.id, text)
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Имя обновлено.", stats_menu(), 8)
-    elif mode == "admin_teamname":
+        await db.update_player_name(msg.from_user.id, text)
+        user_state.pop(msg.from_user.id, None)
+        await ephemeral(msg, f"✅ Имя изменено на «{text}»", sec=8)
+
+    # Смена названия команды
+    elif mode == "set_teamname":
         await db.set_setting(TEAM_NAME_KEY, text)
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Готово.", admin_menu(), 8)
-    elif mode == "admin_rename_player":
+        user_state.pop(msg.from_user.id, None)
+        await ephemeral(msg, f"🏷 Название команды: «{text}»", sec=8)
+
+    # Переименование игрока (админ)
+    elif mode == "rename_player":
         await db.update_player_name(st["pid"], text)
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Игрок переименован.", admin_menu(), 8)
-    elif mode == "admin_birth_player":
-        bd = parse_birth(text)
+        user_state.pop(msg.from_user.id, None)
+        await ephemeral(msg, f"✅ Игрок переименован в «{text}»", sec=8)
+
+    # Дата рождения игрока (админ)
+    elif mode == "player_birth":
+        bd = parse_date(text)
         if not bd:
-            await message.delete()
-            await answer_ephemeral(message, "Дата должна быть ДД.ММ.ГГГГ", admin_menu())
+            await ephemeral(msg, "❌ Неверный формат. Используй ДД.ММ.ГГГГ", sec=8)
             return
         await db.update_player_birth(st["pid"], bd)
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Сохранено.", admin_menu(), 8)
-    elif mode == "admin_number_player":
+        user_state.pop(msg.from_user.id, None)
+        await ephemeral(msg, "✅ Дата рождения сохранена!", sec=8)
+
+    # Номер игрока (админ)
+    elif mode == "player_num":
         try:
-            num = int(text)
+            n = int(text)
         except ValueError:
-            await message.delete()
-            await answer_ephemeral(message, "Нужен номер числом.", admin_menu())
+            await ephemeral(msg, "❌ Нужно ввести число.", sec=8)
             return
-        await db.update_player_number(st["pid"], num)
-        user_state.pop(message.from_user.id, None)
-        await message.delete()
-        await answer_ephemeral(message, "Сохранено.", admin_menu(), 8)
+        await db.update_player_number(st["pid"], n)
+        user_state.pop(msg.from_user.id, None)
+        await ephemeral(msg, f"✅ Игроку присвоен №{n}", sec=8)
+
+    # Мастер матча: ввод счёта (свободный)
     elif mode == "match":
         data = st.setdefault("data", {})
-        if st.get("step") == "score_custom":
+        step = st.get("step")
+
+        if step == "score_custom":
             if ":" not in text:
-                await message.delete()
-                await answer_ephemeral(message, "Формат 3:2", admin_menu())
+                await ephemeral(msg, "❌ Формат: 3:2", sec=8)
                 return
             data["score"] = text
             st["step"] = "ht_custom"
-            await message.delete()
-            await answer_ephemeral(message, "Счёт 1 тайма?", admin_menu())
-        elif st.get("step") == "ht_custom":
+            await ephemeral(msg, "✏️ Счёт первого тайма?", sec=30)
+
+        elif step == "ht_custom":
             if ":" not in text:
-                await message.delete()
-                await answer_ephemeral(message, "Формат 1:0", admin_menu())
+                await ephemeral(msg, "❌ Формат: 1:0", sec=8)
                 return
             data["ht_score"] = text
             st["step"] = "date"
-            await message.delete()
-            await answer_ephemeral(message, "Дата матча: ДД.ММ", admin_menu())
-        elif st.get("step") == "date":
-            if not parse_date(text):
-                await message.delete()
-                await answer_ephemeral(message, "Неверная дата.", admin_menu())
+            await ephemeral(msg, "📅 Дата матча (ДД.ММ):", sec=30)
+
+        elif step == "date":
+            d = parse_date(text)
+            if not d:
+                await ephemeral(msg, "❌ Неверная дата.", sec=8)
                 return
-            data["date"] = text
+            data["date"] = d
             st["step"] = "opponent"
-            await message.delete()
-            await answer_ephemeral(message, "Соперник?", admin_menu())
-        elif st.get("step") == "opponent":
+            await ephemeral(msg, "🏆 Название команды соперника?", sec=30)
+
+        elif step == "opponent":
             data["opponent"] = text
-            date_iso = parse_date(data["date"])
             our, their = map(int, data["score"].split(":"))
             our_ht, their_ht = map(int, data["ht_score"].split(":"))
-            mid = await db.create_match(date_iso, data["opponent"], data.get("venue", "home"))
+            mid = await db.create_match(data["date"], data["opponent"], data.get("venue", "home"))
             await db.update_match_score(mid, our, their, our_ht, their_ht)
-            user_state.pop(message.from_user.id, None)
-            await message.delete()
-            await answer_ephemeral(message, "Матч сохранён.", admin_menu(), 8)
+            user_state.pop(msg.from_user.id, None)
+            await ephemeral(msg, f"✅ Матч с «{text}» ({data['score']}) сохранён!", sec=30)
 
 
-@dp.message()
-async def delete_service_messages(message: Message):
-    if message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP} and message.text and message.text.startswith("/"):
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
+# ═══════════════════════════ ЗАПУСК ═══════════════════════════
 
 async def main():
+    """Точка входа: инициализация БД, установка команд и запуск поллинга."""
     await db.init()
     await set_commands()
     await bot.delete_webhook(drop_pending_updates=True)
