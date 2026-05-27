@@ -11,6 +11,7 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeDefault,
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
@@ -29,8 +30,8 @@ dp = Dispatcher()
 db = Database(DB_PATH)
 
 # Ключи для хранения настроек команды в таблице settings
-TEAM_CHAT_ID_KEY = "team_chat_id"
-TEAM_NAME_KEY = "team_name"
+TEAM_CHAT_ID_KEY = "***"
+TEAM_NAME_KEY = "***"
 
 # Состояния пользователей: {tg_id: {"mode": "...", ...}}
 user_state: dict[int, dict[str, Any]] = {}
@@ -70,6 +71,7 @@ def parse_date(text: str) -> str | None:
 
 
 # ═══════════════════════════ КЛАВИАТУРЫ ═══════════════════════════
+
 
 def main_menu() -> ReplyKeyboardMarkup:
     """
@@ -117,24 +119,15 @@ def stats_menu() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def training_kb(tid: int, counts: dict | None = None) -> InlineKeyboardMarkup:
+def training_kb(tid: int) -> InlineKeyboardMarkup:
     """
     Клавиатура для отметки на тренировку.
-    Если переданы counts — показывает текущие результаты голосования.
+    Кнопки: ✅ Буду / ❌ Не буду / 🤔 Под вопросом.
     """
-    labels = {
-        "yes": "✅",
-        "no": "❌",
-        "maybe": "🤔",
-    }
     kb = InlineKeyboardBuilder()
-    for status, emoji in labels.items():
-        txt = f"{emoji}"
-        if counts:
-            txt += f" {counts.get(status, 0)}"
-        else:
-            txt += {"yes": " Буду", "no": " Не буду", "maybe": " Под вопросом"}[status]
-        kb.button(text=txt, callback_data=f"att:{status}:{tid}")
+    kb.button(text="✅ Буду", callback_data=f"att:yes:{tid}")
+    kb.button(text="❌ Не буду", callback_data=f"att:no:{tid}")
+    kb.button(text="🤔 Под вопросом", callback_data=f"att:maybe:{tid}")
     kb.adjust(3)
     return kb.as_markup()
 
@@ -175,6 +168,7 @@ def player_menu(pid: int) -> InlineKeyboardMarkup:
 
 # ═══════════════════════════ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ═══════════════════════════
 
+
 async def is_admin(chat_id: int, user_id: int) -> bool:
     """Проверка, является ли пользователь администратором чата."""
     try:
@@ -200,12 +194,12 @@ async def del_later(msg: Message, sec: int = 15):
         pass
 
 
-async def ephemeral(msg: Message, text: str, sec: int = 15):
+async def ephemeral(msg: Message, text: str, sec: int = 15, reply_markup=None):
     """
     Отправляет временное сообщение, которое удалится через sec секунд.
-    Используется только для подсказок и статусных сообщений.
+    Используется для подсказок, статусов и т.п.
     """
-    m = await msg.answer(text)
+    m = await msg.answer(text, reply_markup=reply_markup)
     asyncio.create_task(del_later(m, sec))
     return m
 
@@ -273,7 +267,51 @@ async def show_admin_menu(msg: Message):
     await msg.answer("🛠 <b>Администрирование</b>", reply_markup=admin_menu())
 
 
+async def build_training_text(tid: int) -> str:
+    """
+    Формирует текст сообщения о тренировке со сгруппированным списком участников.
+    Пример:
+      🏐 Тренировка
+      📅 27.05 | 20:00
+
+      ✅ Буду (2):
+      · Игрок 1
+      · Игрок 2
+
+      🤔 Под вопросом (1):
+      · Игрок 3
+
+      ❌ Не буду (1):
+      · Игрок 4
+    """
+    tr = await db.get_training(tid)
+    if not tr:
+        return "Тренировка не найдена."
+    dt = date.fromisoformat(tr["date"]).strftime("%d.%m")
+    parts = [f"🏐 <b>Тренировка</b>\n📅 {dt} | {tr['time']}\n"]
+
+    # Получаем список отметившихся
+    attendances = await db.get_training_attendance(tid)
+    grouped = {"yes": [], "no": [], "maybe": []}
+    for a in attendances:
+        player = await db.get_player(a["player_id"])
+        name = player["name"] if player else f"id{a['player_id']}"
+        grouped[a["status"]].append(name)
+
+    labels = {"yes": "✅ Буду", "no": "❌ Не буду", "maybe": "🤔 Под вопросом"}
+    for status in ("yes", "maybe", "no"):
+        names = grouped[status]
+        if names:
+            parts.append(f"{labels[status]} ({len(names)}):")
+            for n in names:
+                parts.append(f"· {n}")
+            parts.append("")
+
+    return "\n".join(parts)
+
+
 # ═══════════════════════════ ДНИ РОЖДЕНИЯ ═══════════════════════════
+
 
 async def birthday_watcher():
     """Фоновая задача: проверяет дни рождения каждые 30 минут."""
@@ -296,20 +334,49 @@ async def birthday_watcher():
         await asyncio.sleep(1800)
 
 
+# ═══════════════════════════ НОВЫЕ УЧАСТНИКИ ═══════════════════════════
+
+
+@dp.chat_member()
+async def on_new_member(event: ChatMemberUpdated):
+    """
+    Приветствует нового участника чата.
+    Срабатывает при добавлении пользователя в группу.
+    """
+    # Проверяем, что это добавление нового человека (а не бота и не выход)
+    if event.new_chat_member.status in ("member", "administrator") and \
+       event.old_chat_member.status in ("left", "kicked", "restricted") and \
+       not event.new_chat_member.user.is_bot:
+        uid = event.new_chat_member.user.id
+        name = event.new_chat_member.user.full_name or "Игрок"
+        await ensure_player(uid, name)
+        tname = await team_name()
+        await event.answer(
+            f"👋 <b>{name}</b>, мы рады приветствовать тебя в команде <b>{tname}</b>! 🎉\n"
+            f"Напиши /start чтобы увидеть меню."
+        )
+
+
 # ═══════════════════════════ ОБРАБОТЧИКИ КОМАНД ═══════════════════════════
+
 
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
     """Команда /start — показывает reply-клавиатуру с главным меню."""
     if msg.chat.type != ChatType.PRIVATE:
         await ensure_team_chat(msg.chat.id)
-    await ensure_player(msg.from_user.id, msg.from_user.full_name or "Игрок")
+    user = msg.from_user
+    await ensure_player(user.id, user.full_name or "Игрок")
     try:
         await msg.delete()
     except Exception:
         pass
-    await ephemeral(msg, "👋 <b>Футзальная команда</b> — используй кнопки меню ниже", sec=8)
-    await msg.answer(".", reply_markup=main_menu())
+    await ephemeral(
+        msg,
+        "👋 <b>Футзальная команда</b>\nИспользуй кнопки меню ниже ⬇️",
+        sec=25,
+        reply_markup=main_menu(),
+    )
 
 
 @dp.message(Command("help"))
@@ -386,12 +453,8 @@ async def cmd_training(msg: Message):
         return
     t = args[2] if len(args) > 2 else "20:00"
     tid = await db.create_training(d, t)
-    tr = await db.get_training(tid)
-    dt = date.fromisoformat(tr["date"]).strftime("%d.%m")
-    await msg.answer(
-        f"🏐 <b>Тренировка</b>\n📅 {dt} | {tr['time']}\n👇 Отметься:",
-        reply_markup=training_kb(tid),
-    )
+    text = await build_training_text(tid)
+    await msg.answer(text, reply_markup=training_kb(tid))
 
 
 @dp.message(Command("roster"))
@@ -411,13 +474,13 @@ async def cmd_roster(msg: Message):
 
 @dp.message(Command("top"))
 async def cmd_top(msg: Message):
-    """Команда /top — рейтинг посещаемости."""
+    """Команда /top — рейтинг посещаемости тренировок."""
     try:
         await msg.delete()
     except Exception:
         pass
     top = await db.get_top_attendance(10)
-    lines = ["🏆 <b>Рейтинг посещаемости</b>"]
+    lines = ["🏆 <b>Рейтинг посещаемости тренировок</b>"]
     for i, p in enumerate(top, 1):
         lines.append(f"{i}. {p['name']} — {p['yes'] or 0}")
     await ephemeral(msg, "\n".join(lines) or "Пока пусто.", sec=30)
@@ -481,6 +544,7 @@ async def cmd_poll(msg: Message):
 
 # ═══════════════════════════ ОБРАБОТЧИКИ CALLBACK-ЗАПРОСОВ ═══════════════════════════
 
+
 @dp.callback_query(F.data == "nav:home")
 async def nav_home(cb: CallbackQuery):
     """Возвращает пользователя к reply-клавиатуре главного меню."""
@@ -489,8 +553,7 @@ async def nav_home(cb: CallbackQuery):
         await cb.message.delete()
     except Exception:
         pass
-    await ephemeral(cb.message, "Главное меню", sec=4)
-    await cb.message.answer(".", reply_markup=main_menu())
+    await ephemeral(cb.message, "Главное меню", sec=4, reply_markup=main_menu())
 
 
 @dp.callback_query(F.data == "nav:admin")
@@ -509,7 +572,10 @@ async def nav_admin(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("att:"))
 async def att_cb(cb: CallbackQuery):
-    """Обрабатывает нажатие кнопки отметки на тренировку, обновляет клавиатуру."""
+    """
+    Обрабатывает нажатие кнопки отметки на тренировку.
+    Обновляет текст сообщения — показывает сгруппированный список участников.
+    """
     _, status, tid = cb.data.split(":")
     tid = int(tid)
     uid = cb.from_user.id
@@ -517,17 +583,13 @@ async def att_cb(cb: CallbackQuery):
     await ensure_player(uid, name)
     await db.set_attendance(tid, uid, status)
 
-    # Получаем актуальные результаты и обновляем клавиатуру
-    attending = await db.get_training_attendance(tid)
-    counts = {"yes": 0, "no": 0, "maybe": 0}
-    for a in attending:
-        s = a["status"]
-        if s in counts:
-            counts[s] += 1
     labels = {"yes": "✅ Буду", "no": "❌ Не буду", "maybe": "🤔 Под вопросом"}
     await cb.answer(f"{labels[status]}", show_alert=False)
+
+    # Пересобираем текст с группами участников и обновляем сообщение
+    text = await build_training_text(tid)
     try:
-        await cb.message.edit_reply_markup(reply_markup=training_kb(tid, counts))
+        await cb.message.edit_text(text, reply_markup=training_kb(tid))
     except Exception:
         pass
 
@@ -549,7 +611,7 @@ async def st_rename(cb: CallbackQuery):
     except Exception:
         pass
     user_state[cb.from_user.id] = {"mode": "rename_self"}
-    await cb.message.answer("✏️ Введи новое имя:", reply_markup=stats_menu())
+    await cb.message.answer("✏️ Введи новое имя:")
 
 
 @dp.callback_query(F.data == "st:birth")
@@ -561,7 +623,7 @@ async def st_birth(cb: CallbackQuery):
     except Exception:
         pass
     user_state[cb.from_user.id] = {"mode": "birth_reg"}
-    await cb.message.answer("🎂 Введи дату рождения в формате ДД.ММ.ГГГГ:", reply_markup=stats_menu())
+    await cb.message.answer("🎂 Введи дату рождения в формате ДД.ММ.ГГГГ:")
 
 
 @dp.callback_query(F.data.startswith("ad:"))
@@ -583,7 +645,7 @@ async def admin_cb(cb: CallbackQuery):
         await ephemeral(cb.message, "Формат: /poll Вопрос | Вариант1 | Вариант2")
     elif action == "teamname":
         user_state[cb.from_user.id] = {"mode": "set_teamname"}
-        await cb.message.answer("🏷 Введи название команды:")
+        await ephemeral(cb.message, "🏷 Введи название команды:", sec=30)
     elif action == "players":
         players = await db.get_all_players()
         if not players:
@@ -594,7 +656,7 @@ async def admin_cb(cb: CallbackQuery):
             kb.button(text=p["name"], callback_data=f"pl:{p['tg_id']}:menu")
         kb.button(text="⬅️ Назад", callback_data="nav:admin")
         kb.adjust(2)
-        await cb.message.answer("👥 Игроки:", reply_markup=kb.as_markup())
+        await cb.message.answer("👥 <b>Игроки</b>", reply_markup=kb.as_markup())
     elif action == "roster":
         players = await db.get_all_players()
         lines = [f"👥 <b>{await team_name()}</b>"]
@@ -604,9 +666,9 @@ async def admin_cb(cb: CallbackQuery):
         await cb.message.answer("\n".join(lines), reply_markup=admin_menu())
     elif action == "top":
         top = await db.get_top_attendance(10)
-        lines = ["🏆 <b>Рейтинг посещаемости</b>"]
+        lines = ["🏆 <b>Рейтинг посещаемости тренировок</b>"]
         for i, p in enumerate(top, 1):
-            lines.append(f"{i}. {p['name']} — {p['yes'] or 0}")
+            lines.append(f"{i}. {p['name']} — {p['yes'] or 0} ✅")
         await cb.message.answer("\n".join(lines), reply_markup=admin_menu())
     elif action == "matches":
         rows = await db.get_matches(10)
@@ -745,6 +807,7 @@ async def poll_vote_cb(cb: CallbackQuery):
 
 # ═══════════════════════════ ОБРАБОТЧИК ТЕКСТОВОГО ВВОДА ═══════════════════════════
 
+
 @dp.message(F.text)
 async def text_input(msg: Message):
     """
@@ -784,7 +847,7 @@ async def text_input(msg: Message):
     elif mode == "set_teamname":
         await db.set_setting(TEAM_NAME_KEY, text)
         user_state.pop(msg.from_user.id, None)
-        await ephemeral(msg, f"🏷 Название команды: «{text}»", sec=8)
+        await ephemeral(msg, f"🏷 Название команды изменено на «{text}»", sec=8)
 
     # Переименование игрока (админ)
     elif mode == "rename_player":
@@ -854,6 +917,7 @@ async def text_input(msg: Message):
 
 
 # ═══════════════════════════ ЗАПУСК ═══════════════════════════
+
 
 async def main():
     """Точка входа: инициализация БД, установка команд и запуск поллинга."""
