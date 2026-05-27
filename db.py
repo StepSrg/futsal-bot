@@ -1,5 +1,5 @@
 import aiosqlite
-from datetime import date, datetime
+from datetime import datetime
 
 
 class Database:
@@ -10,10 +10,17 @@ class Database:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             await db.executescript("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS players (
                     tg_id INTEGER PRIMARY KEY,
                     name TEXT NOT NULL,
                     nickname TEXT,
+                    birth_date TEXT,
+                    player_number INTEGER,
                     joined_at TEXT NOT NULL DEFAULT (datetime('now')),
                     active INTEGER NOT NULL DEFAULT 1
                 );
@@ -61,8 +68,11 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     date TEXT NOT NULL,
                     opponent TEXT NOT NULL,
+                    venue TEXT NOT NULL DEFAULT 'home',
                     our_score INTEGER,
                     their_score INTEGER,
+                    our_ht_score INTEGER,
+                    their_ht_score INTEGER,
                     location TEXT,
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
@@ -79,12 +89,46 @@ class Database:
             """)
             await db.commit()
 
+    # -- Settings --
+    async def get_setting(self, key: str) -> str | None:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = await cur.fetchone()
+            return row["value"] if row else None
+
+    async def set_setting(self, key: str, value: str):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+            await db.commit()
+
     # -- Players --
     async def register_player(self, tg_id: int, name: str, nickname: str = None):
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 "INSERT OR IGNORE INTO players (tg_id, name, nickname) VALUES (?, ?, ?)",
                 (tg_id, name, nickname),
+            )
+            await db.commit()
+
+    async def update_player_name(self, tg_id: int, name: str):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE players SET name = ? WHERE tg_id = ?", (name, tg_id))
+            await db.commit()
+
+    async def update_player_birth(self, tg_id: int, birth_date: str):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE players SET birth_date = ? WHERE tg_id = ?", (birth_date, tg_id)
+            )
+            await db.commit()
+
+    async def update_player_number(self, tg_id: int, number: int):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE players SET player_number = ? WHERE tg_id = ?", (number, tg_id)
             )
             await db.commit()
 
@@ -108,6 +152,23 @@ class Database:
                 "UPDATE players SET active = 0 WHERE tg_id = ?", (tg_id,)
             )
             await db.commit()
+
+    async def get_players_with_birthdays_today(self):
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            today = datetime.now()
+            cur = await db.execute(
+                "SELECT * FROM players WHERE active = 1 AND birth_date IS NOT NULL"
+            )
+            result = []
+            for p in await cur.fetchall():
+                bd = p["birth_date"]
+                if bd and len(bd) >= 5:
+                    bd_mmdd = bd[5:]
+                    today_mmdd = today.strftime("-%m-%d")
+                    if bd_mmdd == today_mmdd:
+                        result.append(p)
+            return result
 
     # -- Trainings --
     async def create_training(self, date_str: str, time_str: str = "20:00", location: str = "Обычное место"):
@@ -133,14 +194,6 @@ class Database:
                 (limit,),
             )
             return await cur.fetchall()
-
-    async def get_last_training(self):
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT * FROM trainings WHERE date <= date('now') ORDER BY date DESC LIMIT 1"
-            )
-            return await cur.fetchone()
 
     # -- Attendance --
     async def set_attendance(self, training_id: int, player_id: int, status: str):
@@ -242,20 +295,20 @@ class Database:
             return results
 
     # -- Matches --
-    async def create_match(self, date_str: str, opponent: str, location: str = ""):
+    async def create_match(self, date_str: str, opponent: str, venue: str = "home", location: str = ""):
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "INSERT INTO matches (date, opponent, location) VALUES (?, ?, ?)",
-                (date_str, opponent, location),
+                "INSERT INTO matches (date, opponent, venue, location) VALUES (?, ?, ?, ?)",
+                (date_str, opponent, venue, location),
             )
             await db.commit()
             return cur.lastrowid
 
-    async def set_match_score(self, match_id: int, our: int, their: int):
+    async def update_match_score(self, match_id: int, our: int, their: int, our_ht: int = None, their_ht: int = None):
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "UPDATE matches SET our_score = ?, their_score = ? WHERE id = ?",
-                (our, their, match_id),
+                "UPDATE matches SET our_score = ?, their_score = ?, our_ht_score = ?, their_ht_score = ? WHERE id = ?",
+                (our, their, our_ht, their_ht, match_id),
             )
             await db.commit()
 
