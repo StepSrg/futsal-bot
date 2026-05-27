@@ -287,7 +287,7 @@ async def build_training_text(tid: int) -> str:
     tr = await db.get_training(tid)
     if not tr:
         return "Тренировка не найдена."
-    dt = date.fromisoformat(tr["date"]).strftime("%d.%m")
+    dt = date.fromisoformat(tr["date"]).strftime("%d.%m.%Y")
     parts = [f"🏐 <b>Тренировка</b>\n📅 {dt} | {tr['time']}\n"]
 
     # Получаем список отметившихся
@@ -497,7 +497,8 @@ async def cmd_matches(msg: Message):
     lines = ["📋 <b>История матчей</b>"]
     for r in rows:
         s = f"{r['our_score'] or '—'}:{r['their_score'] or '—'}"
-        lines.append(f"· {r['date'][:10]} vs {r['opponent']} — {s}")
+        dm = date.fromisoformat(r['date']).strftime('%d.%m.%Y')
+        lines.append(f"· {dm} vs {r['opponent']} — {s}")
     await ephemeral(msg, "\n".join(lines) or "Пока пусто.", sec=30)
 
 
@@ -675,7 +676,7 @@ async def admin_cb(cb: CallbackQuery):
         lines = ["📅 <b>История матчей</b>"]
         for r in rows:
             s = f"{r['our_score'] or '—'}:{r['their_score'] or '—'}"
-            lines.append(f"· {r['date'][:10]} vs {r['opponent']} — {s}")
+            lines.append(f"· {dm} vs {r['opponent']} — {s}")
         await cb.message.answer("\n".join(lines), reply_markup=admin_menu())
     elif action == "match":
         user_state[cb.from_user.id] = {"mode": "match", "data": {}}
@@ -778,7 +779,7 @@ async def match_ht_cb(cb: CallbackQuery):
         await cb.message.delete()
     except Exception:
         pass
-    await cb.message.answer("📅 Дата матча (ДД.ММ):")
+    await ephemeral(cb.message, "📅 Дата матча (ДД.ММ):", sec=15)
 
 
 @dp.callback_query(F.data.startswith("pv:"))
@@ -904,7 +905,7 @@ async def text_input(msg: Message):
                 return
             data["date"] = d
             st["step"] = "opponent"
-            await ephemeral(msg, "🏆 Название команды соперника?", sec=30)
+            await ephemeral(msg, "🏆 С кем играли?", sec=30)
 
         elif step == "opponent":
             data["opponent"] = text
@@ -913,7 +914,9 @@ async def text_input(msg: Message):
             mid = await db.create_match(data["date"], data["opponent"], data.get("venue", "home"))
             await db.update_match_score(mid, our, their, our_ht, their_ht)
             user_state.pop(msg.from_user.id, None)
-            await ephemeral(msg, f"✅ Матч с «{text}» ({data['score']}) сохранён!", sec=30)
+            d_obj = date.fromisoformat(data["date"])
+            d_str = d_obj.strftime("%d.%m.%Y")
+            await ephemeral(msg, f"✅ Матч сыгран с «{text}» ({data['score']}) — {d_str}", sec=30)
 
 
 # ═══════════════════════════ ЗАПУСК ═══════════════════════════
